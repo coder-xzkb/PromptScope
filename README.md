@@ -1,5 +1,7 @@
 # PromptScope
 
+**English** | [简体中文](README.zh-CN.md)
+
 **One image. Different words. Inspect what changes.**
 
 A local visual grounding workbench for exploring how natural-language prompts change a pretrained detector's outputs. Compare Grounding DINO experiments on a shared image, inspect spatial correspondences, and let a bounded agent plan and run prompt variants.

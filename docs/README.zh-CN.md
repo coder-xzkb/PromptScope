@@ -1,5 +1,7 @@
 # PromptScope 使用说明
 
+[中文项目首页](../README.zh-CN.md) | [English](../README.md)
+
 PromptScope 是一个运行在本机的二维视觉检测实验台。使用现成的 Grounding DINO 权重推理，通过不同提示词对比检测结果；不训练、不微调。
 
 ## 本机启动
@@ -94,4 +96,4 @@ LLM 接收研究问题、目标概念和结构化检测结果，图片不会发�
 - 端口被占用：使用 `python -m promptscope --port 8766`，然后打开对应地址。
 - 只用于本机：服务监听 `127.0.0.1`，当前没有多用户登录或公网部署配置。
 
-[返回项目首页](../README.md) · [验证记录](validation.md)
+[返回中文项目首页](../README.zh-CN.md) · [English](../README.md) · [验证记录](validation.md)
