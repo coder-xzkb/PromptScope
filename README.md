@@ -14,6 +14,7 @@ A local visual grounding workbench for exploring how natural-language prompts ch
 - **Pretrained inference.** Official Grounding DINO Tiny / Base snapshots with fixed revisions. No training, fine-tuning, or dataset preparation.
 - **Bounded agent workflow.** Plan 2–4 prompt variants, inspect the plan, execute local detection, compare against the baseline, and produce an evidence-linked report.
 - **Reproducible experiments.** Record prompts, model revisions, parameters, image fingerprints, runtimes and execution traces in local SQLite. Identical experiments reuse results.
+- **Organized experiment history.** Each execution creates its own group. Separate manual/Agent tabs, stars, soft deletion and restore; A/B choices stay inside the selected group.
 - **Portable outputs.** Export JSON, CSV, Markdown and annotated PNG. Import external detections or human annotations for single-image evaluation.
 
 The bundled NASA example includes **actual recorded Tiny inference**, so you can inspect the editor before downloading model weights. Recorded examples, imported detections, and new inference have separate source labels. Failed inference never produces fabricated boxes.
@@ -81,7 +82,9 @@ flowchart LR
 
 **Template mode** works without an API key. It generates a fixed set of linguistic variants and a deterministic report. It is explicitly labeled as a template, not an LLM.
 
-**LLM mode** uses a Chat Completions compatible endpoint supporting JSON mode and `max_completion_tokens`. Set environment variables in the terminal that starts the server:
+**LLM mode** uses a Chat Completions compatible endpoint supporting JSON mode. Click **API 接入** in the header to choose DeepSeek, OpenAI or a custom compatible provider, fetch or enter a model ID, enter your key, and set thinking mode/effort. Saving applies to new requests immediately. A blank key retains the existing key only for the same provider and endpoint. DeepSeek uses `max_tokens`; other endpoints use `max_completion_tokens`. Thinking options depend on model support.
+
+Settings are stored server-side in the ignored data directory as `llm-settings.json` and override environment defaults. Keys are excluded from settings responses and reports. Alternatively, set environment variables before starting the server:
 
 ```powershell
 $env:PROMPTSCOPE_LLM_API_KEY = '<your-key>'
@@ -90,7 +93,9 @@ $env:PROMPTSCOPE_LLM_BASE_URL = 'https://api.openai.com/v1'
 .\.venv\Scripts\python.exe -m promptscope
 ```
 
-The key stays on the server. The configured LLM receives the research question, target, prompts and structured detections; image bytes and filenames are not sent. Provider usage may incur charges. No key is bundled and no live external LLM call was used in local validation.
+The key stays on the server. The configured LLM receives the research question, target, prompts and structured detections; image bytes and filenames are not sent. Provider usage may incur charges. No key is bundled. A local DeepSeek Agent run has been verified; automated provider tests use mocks.
+
+**DeepSeek quick setup (Windows):** copy `deepseek.example.json` to `deepseek.local.json` if the latter does not exist, fill only its empty `api_key`, then double-click `Start-DeepSeek.cmd`. The preconfigured endpoint is `https://api.deepseek.com`, model is `deepseek-flash`, and port is `8766`, following the [official API documentation](https://api-docs.deepseek.com/). Test records use `data/api-test/`; the key-containing local configuration is ignored by Git. Open http://127.0.0.1:8766 and select **LLM Agent**. See the [Chinese walkthrough](docs/README.zh-CN.md#deepseek-快速测试).
 
 The agent has one fixed tool: local detection. It cannot run shell commands, install packages, train models, or choose arbitrary tools. There is one inference worker, at most three queued/running jobs, six prompts per manual job and four per agent plan. Cancellation takes effect between model calls; a running model call is allowed to finish.
 

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -18,6 +19,8 @@ from .detector import GroundingDetector
 from .jobs import Jobs, safe_error
 from .schemas import InferenceRequest, ImportRequest, PlanRequest, CompareRequest, EvaluationRequest
 from .store import Store
+from .experiments import Experiments, KeepRequest
+from .llm_settings import LLMSettings, SettingsInput
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_BYTES = 12 * 1024 * 1024
@@ -46,7 +49,9 @@ class BodyLimit:
 def create_app(data_dir=None, detector=None):
     store = Store(data_dir or os.getenv("PROMPTSCOPE_DATA_DIR", ROOT / "data"))
     engine = detector or GroundingDetector()
-    jobs = Jobs(store, engine)
+    settings = LLMSettings(store.root)
+    jobs = Jobs(store, engine, settings)
+    experiments = Experiments(store, jobs.lock)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -55,6 +60,13 @@ def create_app(data_dir=None, detector=None):
 
     app = FastAPI(title="PromptScope", version="0.1.0", lifespan=lifespan)
     app.state.store, app.state.jobs = store, jobs
+    app.state.llm_settings = settings
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request, exc):
+        # Pydantic's default input echo could include the API key in a settings form.
+        return JSONResponse({"detail": [{"loc": e["loc"], "msg": e["msg"], "type": e["type"]}
+                                         for e in exc.errors()]}, status_code=422)
     app.add_middleware(BodyLimit)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]", "testserver"])
 
@@ -104,8 +116,29 @@ def create_app(data_dir=None, detector=None):
 
     @app.get("/api/status")
     def status():
-        return {"version": "0.1.0", "detector": engine.status(), "llm_configured": agent.configured(),
-                "llm_model": os.getenv("PROMPTSCOPE_LLM_MODEL") if agent.configured() else None}
+        config = settings.public()
+        return {"version": "0.1.0", "detector": engine.status(), "llm_configured": config["configured"],
+                "llm_model": config["model"] if config["configured"] else None}
+
+    @app.get("/api/settings/llm")
+    def llm_settings():
+        return settings.public()
+
+    @app.post("/api/settings/llm")
+    def save_llm_settings(body: SettingsInput):
+        try:
+            return settings.save(body)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+        except OSError:
+            raise HTTPException(500, "无法保存本地配置，请检查数据目录写入权限。")
+
+    @app.post("/api/settings/llm/models")
+    def llm_models(body: SettingsInput):
+        try:
+            return {"models": settings.models(body)}
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
 
     @app.get("/api/images")
     def images():
@@ -139,6 +172,7 @@ def create_app(data_dir=None, detector=None):
                 marker = "sample-v1-" + item["prompt"]
                 if not store.cached(marker):
                     store.put("run", {**item, "image_id": image["id"], "image_sha256": image["sha256"], "cache_key": marker})
+        experiments.sample(image["id"])
         return image
 
     @app.get("/api/runs")
@@ -148,8 +182,41 @@ def create_app(data_dir=None, detector=None):
     @app.post("/api/runs/import")
     def import_run(body: ImportRequest):
         image = get("image", body.image_id)
-        return store.put("run", {**body.model_dump(), "source": "imported", "elapsed_ms": None,
-                                 "image_sha256": image["sha256"], "candidate_floor": None})
+        run = store.put("run", {**body.model_dump(), "source": "imported", "elapsed_ms": None,
+                                "image_sha256": image["sha256"], "candidate_floor": None})
+        experiments.collection(image["id"], [run], "imported")
+        return run
+
+    @app.get("/api/experiments")
+    def list_experiments(deleted: bool = False):
+        return experiments.list(deleted)
+
+    @app.get("/api/experiments/{identifier}")
+    def experiment(identifier: str):
+        try:
+            return experiments.get(identifier)
+        except KeyError:
+            raise HTTPException(404, "Experiment not found")
+
+    def change_experiment(identifier, **changes):
+        try:
+            return experiments.change(identifier, **changes)
+        except KeyError:
+            raise HTTPException(404, "Experiment not found")
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+
+    @app.post("/api/experiments/{identifier}/keep")
+    def keep_experiment(identifier: str, body: KeepRequest):
+        return change_experiment(identifier, kept=body.kept)
+
+    @app.post("/api/experiments/{identifier}/delete")
+    def delete_experiment(identifier: str):
+        return change_experiment(identifier, deleted=True)
+
+    @app.post("/api/experiments/{identifier}/restore")
+    def restore_experiment(identifier: str):
+        return change_experiment(identifier, deleted=False)
 
     @app.post("/api/jobs")
     def start_job(body: InferenceRequest):
@@ -188,11 +255,12 @@ def create_app(data_dir=None, detector=None):
 
     @app.post("/api/agent/plan")
     def plan(body: PlanRequest):
+        config = settings.snapshot()
         try:
-            result = agent.make_plan(body.goal, body.target, body.mode)
+            result = agent.make_plan(body.goal, body.target, body.mode, config)
             return store.put("plan", result)
         except (ValueError, RuntimeError, ValidationError) as exc:
-            raise HTTPException(422, safe_error(exc))
+            raise HTTPException(422, safe_error(exc, config))
         except Exception:
             raise HTTPException(502, "LLM connection failed. Check endpoint and connectivity; no experiment executed.")
 

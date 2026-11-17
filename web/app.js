@@ -1,7 +1,8 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const state = { images: [], image: null, bitmap: null, runs: [], a: null, b: null, plan: null,
-  job: null, threshold: .25, iou: .5, comparison: null, selected: null, busy: false, overlay: false, comparisonSequence: 0 };
+  job: null, experiments: [], trash: [], groupMode: "manual", showTrash: false, runningId: null,
+  threshold: .25, iou: .5, comparison: null, selected: null, busy: false, overlay: false, comparisonSequence: 0 };
 const escapeHTML = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const number = (v, digits = 2) => v == null ? "—" : Number(v).toFixed(digits);
 const sourceNames = {inference: "本机真实推理", recorded_inference: "样例 · 真实推理记录", imported: "外部导入"};
@@ -38,7 +39,8 @@ async function refreshImages() {
   $("imageList").innerHTML = state.images.map(img => `<button class="image-item ${state.image?.id === img.id ? "active" : ""}" data-image="${img.id}" title="${escapeHTML(img.name)}" aria-label="选择图片 ${escapeHTML(img.name)}"><img src="/api/images/${img.id}/file" alt="" width="42" height="42"><span>${escapeHTML(img.name)}</span></button>`).join("");
 }
 let imageSequence = 0;
-async function selectImage(id) {
+async function selectImage(id, group = null) {
+  if(!group)groupSequence++;
   const sequence = ++imageSequence;
   const meta = state.images.find(x => x.id === id);
   if (!meta) return;
@@ -47,27 +49,92 @@ async function selectImage(id) {
   await image.decode();
   if (sequence !== imageSequence) return;
   state.image = meta; state.bitmap = image; state.selected = null;
+  state.job = group; state.a = state.b = null;
+  if(group) renderJob(group); else clearJobView();
+  renderExperiments();
   $("sceneTitle").textContent = meta.name.replace(/\.[a-z]+$/i, "");
   $("imageMeta").textContent = `${meta.width} × ${meta.height} px`;
   document.querySelectorAll(".image-item").forEach(el => el.classList.toggle("active", el.dataset.image === id));
   try { localStorage.setItem("promptscope.image", id); } catch (_) { /* optional preference */ }
-  await refreshRuns();
+  try { localStorage.setItem("promptscope.experiment", group?.id || ""); } catch (_) {}
+  await refreshRuns(group?.run_ids);
 }
 async function refreshRuns(preferredIds) {
   if (!state.image) return drawAll();
-  const imageId = state.image.id;
-  const runs = await api(`/runs?image_id=${imageId}`);
-  if (imageId !== state.image?.id) return;
+  const imageId = state.image.id, groupId = state.job?.id;
+  const allRuns = await api(`/runs?image_id=${imageId}`);
+  if (imageId !== state.image?.id || groupId !== state.job?.id) return;
+  const runs = groupId ? state.job.run_ids.map(id=>allRuns.find(r=>r.id===id)).filter(Boolean) : [];
   state.runs = runs;
   const oldA = state.a?.id, oldB = state.b?.id;
   state.a = runs.find(r => r.id === (preferredIds?.[0] || oldA)) || runs.at(-1) || null;
   state.b = runs.find(r => r.id === (preferredIds?.[1] || oldB)) || runs[0] || null;
   for (const side of ["A", "B"]) {
     const select = $("run" + side);
-    select.innerHTML = runs.length ? runs.map((r, i) => `<option value="${r.id}">${escapeHTML(r.prompt)} · ${escapeHTML(r.model)} #${runs.length-i}</option>`).join("") : "<option>还没有检测结果</option>";
+    select.innerHTML = runs.length ? runs.map((r, i) => `<option value="${r.id}">${escapeHTML(r.prompt)} · ${escapeHTML(r.model)} #${i+1}</option>`).join("") : "<option>当前实验组还没有结果</option>";
     if (state[side.toLowerCase()]) select.value = state[side.toLowerCase()].id;
   }
   renderResults(); await updateComparison();
+}
+const statusNames = {queued:"排队中",running:"运行中",complete:"已完成",failed:"失败",cancelled:"已取消",interrupted:"已中断"};
+async function refreshExperiments() {
+  [state.experiments,state.trash] = await Promise.all([api("/experiments"),api("/experiments?deleted=true")]);
+  renderExperiments();
+}
+function renderExperiments() {
+  const selected=state.experiments.find(g=>g.id===state.job?.id);
+  $("sceneContext").textContent=selected?`${selected.mode==="agent"?"Agent 实验":"手动实验"} / ${selected.source==="recorded_inference"?"内置样例":"实验"} ${String(selected.number).padStart(3,"0")}`:"视觉检测 / 新实验";
+  const list = (state.showTrash ? state.trash : state.experiments).filter(g=>g.mode===state.groupMode);
+  for(const mode of ["manual","agent"]) {
+    const button=$(mode+"Groups");
+    button.classList.toggle("active",state.groupMode===mode);
+    button.setAttribute("aria-pressed",String(state.groupMode===mode));
+    $(mode+"GroupCount").textContent=state.experiments.filter(g=>g.mode===mode).length;
+  }
+  $("trashToggle").textContent=state.showTrash?"返回实验列表":"回收站 · "+state.trash.length;
+  $("trashToggle").setAttribute("aria-pressed",String(state.showTrash));
+  $("historyCount").textContent=state.experiments.length;
+  $("experimentList").innerHTML=list.map(g=>{
+    const label=`实验 ${String(g.number).padStart(3,"0")}`;
+    const busy=["queued","running"].includes(g.status);
+    const source=g.source==="recorded_inference"?"内置样例":g.source==="imported"?"外部导入":statusNames[g.status]||g.status;
+    return `<article class="experiment-card ${state.job?.id===g.id?"active":""}">
+      <button class="experiment-open" data-experiment="${g.id}" ${g.deleted?"disabled":""} aria-label="打开${label}：${escapeHTML(g.image_name)}" ${state.job?.id===g.id?'aria-current="true"':""}>
+      <img src="/api/images/${g.image_id}/file" alt=""><span><strong>${label}${g.kept?" · ★":""}</strong><span class="experiment-name">${escapeHTML(g.image_name)}</span></span></button>
+      <p class="experiment-prompt">${escapeHTML(g.prompts.join(" / "))}</p><p class="experiment-meta">${source} · ${g.prompts.length} 个提示词<br>${escapeHTML(new Date(g.created_at).toLocaleString())}</p>
+      <div class="experiment-actions">${g.deleted?`<button data-group-action="restore" data-id="${g.id}" aria-label="恢复${label}">恢复实验</button>`:`<button data-group-action="keep" data-id="${g.id}" aria-label="${g.kept?"取消保留":"保留"}${label}" aria-pressed="${g.kept}">${g.kept?"★ 已保留":"☆ 保留"}</button><button data-group-action="delete" data-id="${g.id}" aria-label="删除${label}" ${busy?'disabled title="请等待结束或先取消任务"':""}>删除</button>`}</div></article>`;
+  }).join("") || `<p class="experiment-empty">${state.showTrash?"这里没有已删除的实验。":state.groupMode==="manual"?"运行一次手动检测，就会在这里新增一组。":"执行一次 Agent 计划，就会在这里新增一组。"}</p>`;
+}
+function clearJobView() {
+  $("jobBadge").textContent="READY";$("jobBadge").className="badge neutral";
+  $("jobStatus").textContent="选择历史实验，或运行一次新实验。";$("trace").innerHTML="";
+  renderAnalysis(null);
+}
+let groupSequence=0;
+async function openExperiment(id) {
+  const sequence=++groupSequence;
+  const group=await api(`/experiments/${id}`);
+  if(sequence!==groupSequence)return;
+  if(group.deleted)return toast("这组实验在回收站，请先恢复。");
+  state.groupMode=group.mode;state.showTrash=false;
+  state.threshold=.25;state.iou=.5;$("threshold").value=.25;$("thresholdValue").textContent="0.25";$("iou").value="0.5";
+  state.plan=null;$("planResult").innerHTML="";
+  $("prompts").value=group.request.prompts.join("\n");$("prompts").oninput();
+  if(["tiny","base"].includes(group.request.model))$("model").value=group.request.model;
+  $("textThreshold").value=group.request.text_threshold??.25;
+  if(group.plan){state.plan=group.plan;$("goal").value=group.plan.goal;$("agentMode").value=group.plan.mode;displayPlan(group.plan);}
+  inspectorTab(group.mode==="agent");
+  await selectImage(group.request.image_id,group);
+  showTab("workbench");
+}
+async function groupAction(action,id) {
+  const group=[...state.experiments,...state.trash].find(g=>g.id===id);
+  if(!group)return;
+  await api(`/experiments/${id}/${action}`,action==="keep"?{kept:!group.kept}:{});
+  if(action==="delete" && state.job?.id===id)await selectImage(state.image.id);
+  await refreshExperiments();
+  if(!$("history").classList.contains("hidden"))await loadHistory();
+  toast(action==="delete"?"实验已移至回收站，可恢复。原图和共用缓存保留。":action==="restore"?"实验已恢复。":group.kept?"已取消保留标记；实验仍自动保存。":"已标记保留，并置于列表前方。");
 }
 function visible(run) { return (run?.detections || []).filter(d => d.score >= state.threshold); }
 function drawAll() { draw("A"); draw("B"); }
@@ -172,9 +239,13 @@ function setBusy(busy) {
 async function submitJob(planId) {
   if (state.busy) return toast("请等待当前实验完成。");
   const config = requestConfig();
+  groupSequence++;
   setBusy(true);
   try {
     state.job = await api(planId ? `/agent/execute/${planId}` : "/jobs",config);
+    state.runningId=state.job.id;state.groupMode=planId?"agent":"manual";state.showTrash=false;
+    state.a=state.b=null;await refreshRuns();await refreshExperiments();
+    try{localStorage.setItem("promptscope.experiment",state.job.id);}catch(_){}
     await pollJob();
   } catch (e) { setBusy(false); throw e; }
 }
@@ -184,24 +255,47 @@ function renderJob(job) {
   $("jobStatus").textContent = job.message;
   $("trace").innerHTML = job.events.map(e => `<div class="trace-event"><b>${escapeHTML(e.stage)}</b><p>${escapeHTML(e.message)}</p></div>`).join("");
   if (job.report) {
-    $("trace").innerHTML += `<div class="report-text"><b>${job.report.source === "llm" ? "LLM 分析 · 请复核" : "规则报告"}</b><p>${escapeHTML(job.report.summary)}</p><p>${escapeHTML(job.report.next_step)}</p>${job.report.llm_error ? `<p>LLM 报告未生成：${escapeHTML(job.report.llm_error)}</p>` : ""}</div>`;
+    $("trace").innerHTML += '<a class="analysis-link" href="#analysisPanel">查看实验结果分析 ↓</a>';
   }
+  renderAnalysis(job);
+}
+function renderAnalysis(job = state.job) {
+  const current = job?.request.image_id === state.image?.id ? job : null;
+  const report = current?.report;
+  const pending = current && ["running", "queued"].includes(current.status);
+  const savedOnly=current && ["recorded_inference","imported"].includes(current.source);
+  $("analysisBadge").textContent = report ? (report.source === "llm" ? "LLM 分析" : "规则报告") : pending ? "正在实验" : savedOnly ? "已有检测结果" : "等待结果";
+  $("analysisPanel").classList.toggle("has-report", !!report);
+  $("analysisMeta").textContent = current ? `${current.completed} / ${current.request.prompts.length} 组实验 · ${new Date(current.created_at).toLocaleString()}` : "当前图片的实验结论与下一步建议";
+  if (!report) {
+    $("analysisBody").innerHTML = `<p class="analysis-empty">${pending ? "实验正在进行。检测和分析完成后，结论会显示在这里。" : savedOnly ? "这组保存的是样例或导入的检测结果，未生成分析报告。运行新的手动实验或 Agent 计划后，可在对应实验组中查看分析。" : current && ["failed", "cancelled", "interrupted"].includes(current.status) ? escapeHTML(current.message) : "运行手动实验或 Agent 计划后，在这里查看结果分析。已有报告可从侧边实验列表打开。"}</p>`;
+    return;
+  }
+  $("analysisBody").innerHTML = `${current.plan?.goal ? `<p class="analysis-question"><span>研究问题</span>${escapeHTML(current.plan.goal)}</p>` : ""}
+    <div class="analysis-summary"><h3>结果解读</h3><p>${escapeHTML(report.summary)}</p></div>
+    <div class="analysis-next"><h3>下一步建议</h3><p>${escapeHTML(report.next_step)}</p></div>
+    ${report.llm_error ? `<p class="analysis-error">LLM 分析未生成，当前显示规则报告：${escapeHTML(report.llm_error)}</p>` : ""}
+    <details class="analysis-context"><summary>查看这份报告对应的实验与参数</summary><ul>${current.request.prompts.map(p=>`<li>${escapeHTML(p)}</li>`).join("")}</ul><p>分析使用本次任务的全部实验，固定显示阈值 0.25、匹配 IoU 0.50；切换上方 A / B 或滑块不会重写这份报告。${report.source === "llm" ? "LLM 仅依据结构化检测结果分析，结论请结合标注或人工检查。" : "规则报告不包含大模型分析。"}</p></details>`;
 }
 async function pollJob() {
   clearTimeout(pollTimer);
-  if (!state.job) return;
+  if (!state.runningId) return;
+  const id=state.runningId;
   try {
-    const job = await api(`/jobs/${state.job.id}`); state.job = job; renderJob(job);
+    const job = await api(`/jobs/${id}`);
+    if(state.job?.id===id){state.job=job;renderJob(job);}
+    await refreshExperiments();
     if (["queued","running"].includes(job.status)) {
       setBusy(true); pollTimer = setTimeout(pollJob,1600);
     } else {
       setBusy(false);
-      if (job.request.image_id === state.image?.id) await refreshRuns(job.run_ids);
+      state.runningId=null;
+      if (state.job?.id===id) await refreshRuns(job.run_ids);
       await refreshStatus();
-      toast(job.status === "complete" ? "实验已完成，结果与轨迹已保存。" : job.message);
+      toast(job.status === "complete" ? "实验已完成，分析已显示在检测明细下方。" : job.message);
     }
   } catch (e) {
-    $("jobStatus").textContent = "连接暂时中断，正在重试。任务仍可能在服务器运行。";
+    if(state.job?.id===id)$("jobStatus").textContent = "连接暂时中断，正在重试。任务仍可能在服务器运行。";
     pollTimer = setTimeout(pollJob,4000);
   }
 }
@@ -209,32 +303,29 @@ async function refreshStatus() {
   const status = await api("/status");
   const d = status.detector;
   $("modelState").textContent = d.loaded ? `${d.loaded.toUpperCase()} · ${d.device.toUpperCase()}` : d.installed ? "模型按需加载" : "需安装模型依赖";
-  $("llmStatus").textContent = status.llm_configured ? `已配置：${status.llm_model}。仅发送文本和检测结果。` : "未配置 LLM；可先使用本地模板，或在使用说明中查看配置方式。";
+  $("llmStatus").textContent = status.llm_configured ? `已配置：${status.llm_model}。仅发送文本和检测结果。` : "未配置 LLM；点击顶部「API 接入」配置，或先使用本地模板。";
   $("agentMode").options[1].disabled = !status.llm_configured;
+  if(!status.llm_configured) $("agentMode").value="template";
+}
+function displayPlan(plan) {
+    $("planResult").innerHTML = `<div class="eyebrow">${plan.mode === "template" ? "TEMPLATE PLAN" : "LLM PLAN"} / ${plan.experiments.length} RUNS</div>` + plan.experiments.map((e,i) => `<div class="plan-item"><span class="plan-index">0${i+1}</span><b>${escapeHTML(e.prompt)}</b><p>${escapeHTML(e.rationale)}</p></div>`).join("") + `<p class="plan-caveat">${escapeHTML(plan.caveat)}</p><button id="executePlan" class="button primary full" ${state.busy?"disabled":""}>执行这组实验 →</button><button id="editPlan" class="text-button">复制到提示词框，手动编辑</button>`;
+    $("executePlan").onclick = guarded(() => submitJob(plan.id));
+    $("editPlan").onclick = () => { $("prompts").value = plan.experiments.map(e=>e.prompt).join("\n"); $("prompts").oninput(); inspectorTab(false); $("prompts").focus(); toast("已复制。编辑后通过「运行检测」执行手动实验。"); };
 }
 async function createPlan() {
   const button = $("plan"); button.disabled = true; button.textContent = "正在规划…";
   try {
     const plan = await api("/agent/plan",{goal:$("goal").value,target:$("target").value,mode:$("agentMode").value});
     state.plan = plan;
-    $("planResult").innerHTML = `<div class="eyebrow">${plan.mode === "template" ? "TEMPLATE PLAN" : "LLM PLAN"} / ${plan.experiments.length} RUNS</div>` + plan.experiments.map((e,i) => `<div class="plan-item"><span class="plan-index">0${i+1}</span><b>${escapeHTML(e.prompt)}</b><p>${escapeHTML(e.rationale)}</p></div>`).join("") + `<p class="plan-caveat">${escapeHTML(plan.caveat)}</p><button id="executePlan" class="button primary full" ${state.busy?"disabled":""}>执行这组实验 →</button><button id="editPlan" class="text-button">复制到提示词框，手动编辑</button>`;
-    $("executePlan").onclick = guarded(() => submitJob(plan.id));
-    $("editPlan").onclick = () => { $("prompts").value = plan.experiments.map(e=>e.prompt).join("\n"); $("prompts").oninput(); inspectorTab(false); $("prompts").focus(); toast("已复制。编辑后通过「运行检测」执行手动实验。"); };
+    displayPlan(plan);
   } finally { button.disabled = false; button.textContent = '生成实验计划'; }
 }
 async function loadHistory() {
-  const [runs,jobs] = await Promise.all([api("/runs"),api("/jobs")]);
-  $("historyCount").textContent = runs.length;
-  const html = runs.map(r=>{
-    const image=state.images.find(x=>x.id===r.image_id);
-    return `<article class="panel history-card"><img src="/api/images/${r.image_id}/file" alt=""><div class="history-body"><h2>${escapeHTML(r.prompt)}</h2><p>${escapeHTML(image?.name || "image")} · ${escapeHTML(r.model)} · ${sourceNames[r.source] || escapeHTML(r.source)} · ${r.detections.length} 候选框</p><p>${escapeHTML(new Date(r.created_at).toLocaleString())} · revision ${escapeHTML(r.revision?.slice(0,10) || "未提供")}</p></div><button class="button secondary" data-open-run="${r.id}" data-image="${r.image_id}">查看结果 ↗</button></article>`;
+  await refreshExperiments();
+  $("historyList").innerHTML=["manual","agent"].map(mode=>{
+    const groups=state.experiments.filter(g=>g.mode===mode);
+    return `<section class="history-section"><h2>${mode==="manual"?"手动实验":"Agent 实验"} · ${groups.length}</h2>`+groups.map(g=>`<article class="panel history-card"><img src="/api/images/${g.image_id}/file" alt=""><div class="history-body"><h2>实验 ${String(g.number).padStart(3,"0")} ${g.kept?"★":""} · ${escapeHTML(g.image_name)}</h2><p>${escapeHTML(g.prompts.join(" / "))}</p><p>${escapeHTML(new Date(g.created_at).toLocaleString())} · ${statusNames[g.status]||escapeHTML(g.status)}</p></div><button class="button secondary" data-experiment="${g.id}">打开实验组 ↗</button></article>`).join("")+(groups.length?"":'<p class="experiment-empty">还没有这类实验。</p>')+'</section>';
   }).join("");
-  $("historyList").innerHTML = html || '<div class="panel empty-state">还没有实验。回到工作台，加载样例或运行一次检测。</div>';
-  if (jobs.length) {
-    const section = document.createElement("section");section.className="panel prose";
-    section.innerHTML = "<h2>任务与 Agent 轨迹</h2>" + jobs.map(j=>`<p><button class="text-button" data-job="${j.id}">${escapeHTML(j.status.toUpperCase())} · ${escapeHTML(j.created_at.slice(0,19))} · ${j.completed}/${j.request.prompts.length} 组</button> ${escapeHTML(j.plan?.goal || "手动实验")}</p>`).join("");
-    $("historyList").append(section);
-  }
 }
 function reportBundle() {
   return {schema_version:1,exported_at:new Date().toISOString(),image:state.image,runs:state.runs,
@@ -248,7 +339,7 @@ function csvCell(value) {
 }
 function exportDialog() {
   if (!state.image || !state.runs.length) return toast("请先运行实验，或加载带结果的样例。");
-  modal("导出实验", '<p>导出当前图片的全部实验，包含模型版本、提示词、参数和检测框。图片文件与权重不包含在报告中。</p><button class="button primary" id="exportJSON">JSON · 完整记录</button><button class="button secondary" id="exportCSV">CSV · 检测明细</button><button class="button secondary" id="exportMD">Markdown · 对比报告</button>');
+  modal("导出实验", '<p>导出当前实验组的结果，包含模型版本、提示词、参数和检测框。图片文件与权重不包含在报告中。</p><button class="button primary" id="exportJSON">JSON · 完整记录</button><button class="button secondary" id="exportCSV">CSV · 检测明细</button><button class="button secondary" id="exportMD">Markdown · 对比报告</button>');
   $("exportJSON").onclick=()=>download("promptscope-experiment.json",JSON.stringify(reportBundle(),null,2),"application/json");
   $("exportCSV").onclick=()=>{
     const rows=[["run_id","prompt","model","source","label","score","x1","y1","x2","y2"]];
@@ -281,22 +372,77 @@ async function handleJSON(file) {
     if (rows.length > 100) throw new Error("一次最多导入 100 组结果。");
     if (data.image?.sha256 && data.image.sha256 !== state.image.sha256) throw new Error("报告的图片指纹与当前图片不同，请先上传正确图片。");
     for (const row of rows) await api("/runs/import",{image_id:state.image.id,prompt:row.prompt,model:row.model||"external",detections:row.detections});
-    await refreshRuns(); toast(`已导入 ${rows.length} 组结果。`);
+    await refreshExperiments();const imported=state.experiments.find(g=>g.image_id===state.image.id&&g.source==="imported");if(imported)await openExperiment(imported.id);toast(`已导入 ${rows.length} 组结果。`);
   }
 }
+
+async function openAPISettings() {
+  const saved=await api("/settings/llm");
+  modal("API 接入",`<form id="apiForm" class="api-form">
+    <p class="api-intro">为 Agent 配置规划与分析模型。保存后立即生效，新任务使用新设置。</p>
+    <div class="api-form-grid"><div><label for="apiProvider">运营商</label><select id="apiProvider"><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option><option value="custom">自定义兼容服务</option></select></div>
+    <div id="apiNameField"><label for="apiProviderName">运营商名称</label><input id="apiProviderName" maxlength="80" placeholder="例如：我的模型服务"></div></div>
+    <label for="apiBaseURL">接口基础地址</label><input id="apiBaseURL" type="url" required placeholder="https://.../v1" autocomplete="off"><p class="api-hint">使用 Chat Completions 兼容接口，不追加 /chat/completions。</p>
+    <label for="apiKey">API Key <span id="apiKeyState"></span></label><input id="apiKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="填写此运营商的 API Key"><p id="apiKeyHint" class="api-hint"></p>
+    <div class="api-model-heading"><label for="apiModel">模型</label><button id="apiLoadModels" type="button" class="text-button">获取模型列表</button></div><input id="apiModel" list="apiModels" maxlength="160" required autocomplete="off" placeholder="获取列表后选择，或直接填写模型 ID"><datalist id="apiModels"></datalist>
+    <p class="api-hint">列表可能含非对话模型，请选择支持 JSON 输出的对话模型。</p>
+    <div class="api-form-grid"><div><label for="apiThinking">思考模式</label><select id="apiThinking"><option value="default">跟随模型默认</option><option value="disabled">关闭思考</option><option value="enabled">开启思考</option></select></div><div><label for="apiEffort">思考强度</label><select id="apiEffort"></select></div></div>
+    <p id="apiThinkingHint" class="api-hint"></p>
+    <label class="api-clear"><input id="apiClearKey" type="checkbox"> 清除已保存的密钥（停用 API）</label>
+    <p class="api-privacy">密钥仅保存在本机服务端，不会回填到页面或放进导出报告。模型调用按运营商规则计费。</p>
+    <p id="apiSettingsStatus" role="status" aria-live="polite"></p>
+    <div class="api-form-actions"><button type="button" id="apiCancel" class="button secondary">取消</button><button id="apiSave" class="button primary" type="submit">保存并应用</button></div>
+  </form>`);
+  $("apiProvider").value=saved.provider;$("apiProviderName").value=saved.provider_name||"";
+  $("apiBaseURL").value=saved.base_url;$("apiModel").value=saved.model;
+  $("apiThinking").value=saved.thinking;
+  const presets={deepseek:{base:"https://api.deepseek.com",model:"deepseek-flash",name:"DeepSeek"},openai:{base:"https://api.openai.com/v1",model:"",name:"OpenAI"},custom:{base:"",model:"",name:""}};
+  function updateOptions(effort=$("apiEffort").value||"high") {
+    const provider=$("apiProvider").value;
+    $("apiNameField").classList.toggle("hidden",provider!=="custom");
+    $("apiBaseURL").readOnly=provider!=="custom";
+    const options=provider==="deepseek"?[["low","低"],["high","高"],["max","最高"]]:[["low","低"],["medium","中"],["high","高"]];
+    $("apiEffort").innerHTML=options.map(([v,t])=>`<option value="${v}">${t}</option>`).join("");
+    $("apiEffort").value=options.some(([v])=>v===effort)?effort:"high";
+    $("apiEffort").disabled=$("apiThinking").value!=="enabled";
+    const reuse=saved.api_key_set&&provider===saved.provider&&$("apiBaseURL").value.replace(/\/$/,"")===saved.base_url;
+    $("apiKeyState").textContent=reuse?"已配置":"未配置";
+    $("apiKeyHint").textContent=reuse?"留空可继续使用此接口已保存的密钥；填写新值会替换。":"请填写当前运营商的密钥；切换接口不会沿用旧密钥。";
+    $("apiThinkingHint").textContent=provider==="deepseek"?"DeepSeek 支持关闭思考，开启后可选择低、高或最高强度。":"不同模型支持的参数不同；不支持思考参数时请选择「跟随模型默认」。关闭模式要求模型支持 reasoning_effort=none。";
+  }
+  updateOptions(saved.reasoning_effort);
+  const form=$("apiForm"),status=$("apiSettingsStatus"),keyInput=$("apiKey"),saveButton=$("apiSave"),modelsList=$("apiModels");
+  $("apiModels").innerHTML=saved.provider==="deepseek"?'<option value="deepseek-flash"><option value="deepseek-v4-pro">':"";
+  $("apiProvider").onchange=()=>{const p=presets[$("apiProvider").value];$("apiBaseURL").value=p.base;$("apiModel").value=p.model;$("apiProviderName").value=p.name;$("apiKey").value="";$("apiClearKey").checked=false;$("apiThinking").value=$("apiProvider").value==="deepseek"?"disabled":"default";$("apiModels").innerHTML=$("apiProvider").value==="deepseek"?'<option value="deepseek-flash"><option value="deepseek-v4-pro">':"";$("apiSettingsStatus").textContent="";updateOptions();};
+  $("apiThinking").onchange=()=>updateOptions();$("apiBaseURL").oninput=()=>updateOptions();
+  function values(){return {provider:$("apiProvider").value,provider_name:$("apiProviderName").value,base_url:$("apiBaseURL").value,model:$("apiModel").value,api_key:$("apiKey").value,thinking:$("apiThinking").value,reasoning_effort:$("apiEffort").value,clear_key:$("apiClearKey").checked};}
+  $("apiLoadModels").onclick=async()=>{
+    const button=$("apiLoadModels");button.disabled=true;$("apiSettingsStatus").textContent="正在获取模型列表…";
+    const draft=values();
+    try{const result=await api("/settings/llm/models",draft);if(form.isConnected&&$("apiProvider").value===draft.provider&&$("apiBaseURL").value===draft.base_url){modelsList.innerHTML=result.models.map(m=>`<option value="${escapeHTML(m)}">`).join("");status.textContent=`获取到 ${result.models.length} 个模型，可在模型输入框中选择；未运行实验。`;}}
+    catch(e){status.textContent=e.message;}finally{button.disabled=false;}
+  };
+  $("apiCancel").onclick=()=>$("modal").close();
+  $("apiForm").onsubmit=async e=>{
+    e.preventDefault();saveButton.disabled=true;
+    try{const result=await api("/settings/llm",values());keyInput.value="";await refreshStatus();if(form.isConnected)$("modal").close();toast(result.configured?"API 设置已生效，新实验使用新配置。":"密钥已清除或未填写；当前使用本地模板。 ");}
+    catch(error){status.textContent=error.message;}finally{saveButton.disabled=false;}
+  };
+}
+$("apiSettings").onclick=guarded(openAPISettings);
 
 document.querySelectorAll(".nav").forEach(el=>el.onclick=()=>showTab(el.dataset.tab));
 $("help").onclick=()=>showTab("guide"); $("closeModal").onclick=()=>$("modal").close();
 function applyTheme(dark) {
   document.body.classList.toggle("dark",dark); $("theme").textContent=dark?"浅色":"深色";
   document.documentElement.style.colorScheme=dark?"dark":"light";
-  document.querySelector('meta[name="theme-color"]').content=dark?"#1b1b1e":"#f5f5f7";
+  document.querySelector('meta[name="theme-color"]').content=dark?"#30343b":"#f5f5f7";
   drawAll();
 }
 $("theme").onclick=()=>{const dark=!document.body.classList.contains("dark");applyTheme(dark);try{localStorage.setItem("promptscope.theme.v2",dark?"dark":"light");}catch(_){}};
 for(const id of ["upload","addImage"]) $(id).onclick=()=>$("fileInput").click();
 $("fileInput").onchange=guarded(async e=>{await uploadFile(e.target.files[0]);e.target.value="";});
-$("sample").onclick=guarded(async()=>{const img=await api("/sample",{});await refreshImages();await selectImage(img.id);showTab("workbench");});
+$("sample").onclick=guarded(async()=>{const img=await api("/sample",{});await refreshImages();await refreshExperiments();const group=state.experiments.find(g=>g.image_id===img.id&&g.source==="recorded_inference");if(group)await openExperiment(group.id);else{await selectImage(img.id);toast("样例实验在回收站，可恢复后查看。");}showTab("workbench");});
 $("imageList").onclick=guarded(async e=>{const b=e.target.closest("[data-image]");if(b){await selectImage(b.dataset.image);showTab("workbench");}});
 for(const side of ["A","B"]) {
   $("run"+side).onchange=guarded(async e=>{state[side.toLowerCase()]=state.runs.find(r=>r.id===e.target.value);state.selected=null;renderResults();await updateComparison();});
@@ -318,13 +464,14 @@ $("iou").onchange=guarded(async e=>{state.iou=Number(e.target.value);await updat
 $("showLabels").onchange=drawAll;
 $("detections").onclick=e=>{const row=e.target.closest("[data-side]");if(row)chooseDetection(row.dataset.side,Number(row.dataset.index));};
 $("run").onclick=guarded(()=>submitJob()); $("plan").onclick=guarded(createPlan);
-$("cancel").onclick=guarded(async()=>{if(state.job){await api(`/jobs/${state.job.id}/cancel`,{});toast("已请求取消，将在当前模型调用结束后停止后续实验。");}});
+$("cancel").onclick=guarded(async()=>{if(state.runningId){await api(`/jobs/${state.runningId}/cancel`,{});toast("已请求取消，将在当前模型调用结束后停止后续实验。");}});
 $("export").onclick=exportDialog; $("refreshHistory").onclick=guarded(loadHistory);
 $("historyList").onclick=guarded(async e=>{
-  const run=e.target.closest("[data-open-run]"),job=e.target.closest("[data-job]");
-  if(run){await selectImage(run.dataset.image);await refreshRuns([run.dataset.openRun]);showTab("workbench");}
-  if(job){state.job=await api(`/jobs/${job.dataset.job}`);renderJob(state.job);showTab("workbench");if(["queued","running"].includes(state.job.status))await pollJob();}
+  const group=e.target.closest("[data-experiment]");if(group)await openExperiment(group.dataset.experiment);
 });
+$("experimentList").onclick=guarded(async e=>{const action=e.target.closest("[data-group-action]"),group=e.target.closest("[data-experiment]");if(action)await groupAction(action.dataset.groupAction,action.dataset.id);else if(group)await openExperiment(group.dataset.experiment);});
+for(const mode of ["manual","agent"])$(mode+"Groups").onclick=guarded(async()=>{state.groupMode=mode;state.showTrash=false;const first=state.experiments.find(g=>g.mode===mode);if(first)await openExperiment(first.id);else{state.job=null;state.plan=null;$("planResult").innerHTML="";clearJobView();renderExperiments();await refreshRuns();inspectorTab(mode==="agent");showTab("workbench");}});
+$("trashToggle").onclick=()=>{state.showTrash=!state.showTrash;renderExperiments();};
 $("import").onclick=()=>{jsonAction="import";$("jsonInput").click();};
 $("evaluate").onclick=()=>{if(!state.a)return toast("请先选择实验 A。");jsonAction="evaluate";$("jsonInput").click();};
 $("jsonInput").onchange=guarded(async e=>{try{await handleJSON(e.target.files[0]);}finally{e.target.value="";}});
@@ -353,10 +500,12 @@ async function initialize() {
   let dark=true;try{dark=localStorage.getItem("promptscope.theme.v2")!=="light";}catch(_){}applyTheme(dark);
   await refreshStatus(); await refreshImages();
   if(!state.images.length){await api("/sample",{});await refreshImages();}
-  let remembered;try{remembered=localStorage.getItem("promptscope.image");}catch(_){}
+  let remembered,rememberedGroup;try{remembered=localStorage.getItem("promptscope.image");rememberedGroup=localStorage.getItem("promptscope.experiment");}catch(_){}
   await selectImage(state.images.find(i=>i.id===remembered)?.id||state.images[0]?.id);
-  const jobs=await api("/jobs");const active=jobs.find(j=>["queued","running"].includes(j.status));
-  if(active){state.job=active;await pollJob();}else if(jobs.length){state.job=jobs[0];renderJob(state.job);}
-  $("historyCount").textContent=(await api("/runs")).length;
+  await refreshExperiments();
+  const first=state.experiments.find(g=>g.id===rememberedGroup)||state.experiments.find(g=>g.image_id===state.image?.id)||state.experiments[0];
+  if(first)await openExperiment(first.id);
+  const active=state.experiments.find(g=>["queued","running"].includes(g.status));
+  if(active){state.runningId=active.id;await pollJob();}
 }
 initialize().catch(e=>{$("jobStatus").textContent=`连接失败：${e.message}。请从启动脚本运行项目。`;toast(e.message);});

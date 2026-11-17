@@ -4,6 +4,10 @@ __pycache__/
 .pytest_cache/
 .env
 .env.*
+deepseek.local.json
+*.local.json
+llm-settings.json
+llm-settings.tmp
 data/
 models/
 artifacts/

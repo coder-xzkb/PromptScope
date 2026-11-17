@@ -7,8 +7,10 @@ from . import agent
 
 
 class Jobs:
-    def __init__(self, store, detector):
+    def __init__(self, store, detector, settings=None):
         self.store, self.detector = store, detector
+        self.settings = settings
+        self.llm_configs = {}
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="promptscope")
         self.slots = threading.BoundedSemaphore(3)
         self.cancelled = set()
@@ -27,6 +29,7 @@ class Jobs:
             raise RuntimeError("Queue is full (3 jobs). Wait for a job to finish.")
         job = self.store.put("job", {"status": "queued", "message": "Waiting for inference worker", "run_ids": [],
                                     "request": request, "plan": plan, "events": [], "completed": 0})
+        self.llm_configs[job["id"]] = self.settings.snapshot() if self.settings else None
         self.pool.submit(self.run, job["id"])
         return job
 
@@ -42,6 +45,7 @@ class Jobs:
             self.cancelled.add(job_id)
 
     def run(self, job_id):
+        config = self.llm_configs.get(job_id)
         try:
             job = self.update(job_id, status="running")
             req, runs = job["request"], []
@@ -77,25 +81,30 @@ class Jobs:
             if job["plan"] and job["plan"]["mode"] == "llm" and job_id not in self.cancelled:
                 self.event(job_id, "analyze", "Sending prompts and structured results to the configured LLM; image stays local.")
                 try:
-                    report.update(agent.summarize(job["plan"], runs, comparisons))
+                    report.update(agent.summarize(job["plan"], runs, comparisons, config))
                     report["source"] = "llm"
+                    if config:
+                        report["llm_model"] = config["model"]
                 except Exception as exc:
-                    report["llm_error"] = safe_error(exc)
+                    report["llm_error"] = safe_error(exc, config)
             self.update(job_id, status="complete", message="Experiment complete; results saved locally.", report=report)
             self.event(job_id, "report", "Saved reproducible experiment report.")
         except Exception as exc:
-            self.update(job_id, status="failed", message=safe_error(exc))
+            self.update(job_id, status="failed", message=safe_error(exc, config))
         finally:
             with self.lock:
                 self.cancelled.discard(job_id)
+                self.llm_configs.pop(job_id, None)
             self.slots.release()
 
 
-def safe_error(exc):
+def safe_error(exc, config=None):
     message = str(exc)[:1600]
     # Provider keys must not enter browser state or saved reports.
     import os
     key = os.getenv("PROMPTSCOPE_LLM_API_KEY")
     if key:
         message = message.replace(key, "[redacted]")
+    if config and config.get("api_key"):
+        message = message.replace(config["api_key"], "[redacted]")
     return f"{type(exc).__name__}: {message}"
