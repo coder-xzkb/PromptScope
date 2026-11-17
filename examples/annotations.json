@@ -1,0 +1,7 @@
+{
+  "ground_truth": [
+    {"label": "person", "box": [0.03, 0.02, 0.72, 1.0]},
+    {"label": "helmet", "box": [0.54, 0.66, 1.0, 1.0]}
+  ],
+  "label_map": {"astronaut": "person", "a person": "person", "a astronaut": "person", "an astronaut": "person"}
+}
